@@ -1,0 +1,161 @@
+// glow-chat — the Drayford AI rail on the Glow demo (BAS-1141). Deployed at
+// glow-chat.basecarriers.workers.dev via the Cloudflare API.
+//
+// POST { key, page, question, context, history: [{role, content}] }
+// Streams Anthropic SSE straight through (Claude Opus 5, same engine as the
+// FOS Board AI). Env: ANTHROPIC_API_KEY (secret), CHAT_KEY.
+
+const MODEL = "claude-opus-5";
+
+const CORS = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "POST,OPTIONS",
+  "Access-Control-Allow-Headers": "*",
+};
+
+const PAGES = {
+  rooms: "Ripening Rooms — 24 pressurized ripening rooms at 250 Beacham St (stage 1-7 color scale, gas days, pull dates, committed customers)",
+  yard: "My Yard — every container sitting at 250 Beacham right now: owner, loaded/empty/rejected state, unload confirmations (who, room, proof photo), swaps",
+  fleet: "My Fleet — Yell-O-Glow's own delivery trucks on store routes: stop-by-stop progress, driver, status",
+  import: "Order Import — paste Jackie's weekly order sheet and the platform drafts every load (vendor, SSL, setpoint, delivery window) with no retyping",
+};
+
+export default {
+  async fetch(req, env, exec) {
+    if (req.method === "OPTIONS") return new Response(null, { headers: CORS });
+    const url = new URL(req.url);
+    // GET /log?key=...&limit=200 — read the question log (metadata-only list,
+    // newest first). Every question Glow asks is a feature request in their
+    // own words; this is the roadmap feed.
+    if (req.method === "GET" && url.pathname === "/log") {
+      if (url.searchParams.get("key") !== env.CHAT_KEY) return new Response("forbidden", { status: 403, headers: CORS });
+      const limit = Math.min(parseInt(url.searchParams.get("limit") || "200", 10) || 200, 1000);
+      const out = [];
+      let cursor;
+      while (out.length < limit) {
+        const page = await env.CHAT_LOG.list({ limit: Math.min(1000, limit - out.length), cursor });
+        for (const k of page.keys) out.push({ key: k.name, ...(k.metadata || {}) });
+        if (page.list_complete || !page.cursor) break;
+        cursor = page.cursor;
+      }
+      out.sort((a, b) => (b.t || "").localeCompare(a.t || ""));
+      return new Response(JSON.stringify({ count: out.length, questions: out.slice(0, limit) }), {
+        headers: { ...CORS, "Content-Type": "application/json" },
+      });
+    }
+    if (req.method !== "POST") return new Response("POST only", { status: 405, headers: CORS });
+    let body;
+    try {
+      body = await req.json();
+    } catch {
+      return new Response("bad json", { status: 400, headers: CORS });
+    }
+    if (body.key !== env.CHAT_KEY) return new Response("forbidden", { status: 403, headers: CORS });
+
+    const question = String(body.question || "").slice(0, 2000);
+    if (!question) return new Response("empty question", { status: 400, headers: CORS });
+    const page = String(body.page || "rooms");
+    let ctx = "";
+    try {
+      ctx = JSON.stringify(body.context ?? {}).slice(0, 45000);
+    } catch {
+      ctx = "{}";
+    }
+    // Vision: yard-check photos etc. — data URLs forwarded as image blocks.
+    const images = Array.isArray(body.images)
+      ? body.images
+          .slice(0, 26)
+          .map((d) => String(d))
+          .filter((d) => d.startsWith("data:image/") && d.length < 2600000)
+      : [];
+    // Documents: PDFs forwarded as native document blocks.
+    const docs = Array.isArray(body.docs)
+      ? body.docs
+          .slice(0, 6)
+          .map((d) => String(d))
+          .filter((d) => d.startsWith("data:application/pdf") && d.length < 6000000)
+      : [];
+    const history = Array.isArray(body.history)
+      ? body.history
+          .slice(-8)
+          .filter((m) => m && (m.role === "user" || m.role === "assistant") && typeof m.content === "string")
+          .map((m) => ({ role: m.role, content: m.content.slice(0, 4000) }))
+      : [];
+
+    // Log every question (fire-and-forget; 90-day TTL). Metadata carries the
+    // preview so /log never needs per-key reads.
+    try {
+      const t = new Date().toISOString();
+      const key = `${t}-${Math.random().toString(36).slice(2, 8)}`;
+      const meta = { t, page, q: question.slice(0, 480), imgs: images.length };
+      exec.waitUntil(env.CHAT_LOG.put(key, JSON.stringify({ ...meta, qFull: question }), { expirationTtl: 7776000, metadata: meta }));
+    } catch {}
+
+    const system = `You are the Drayford AI, embedded in the "${page}" screen (${PAGES[page] || page}) of Drayford — Fresh Logistics OS, the logistics workspace built for Yell-O-Glow (4th-generation banana & plantain processor, 250 Beacham St, Everett MA; Chelsea cash & carry). The screen's live data — synced from BASE Carriers' dispatch system — is below.
+
+Rules:
+- Answer directly and concisely in plain ops language: 1-5 sentences, or a tight list when listing is clearer.
+- Use ONLY the data provided. Never invent numbers, containers, POs, or names.
+- If the answer isn't in this screen's data, say so in one line and point to the right screen (Today, Inbound Board, Outbound Board, Order Import, My Fleet, Ripening Rooms, My Yard, Rejections, Money Guard).
+- Dates/times in the data are US Eastern. Today is ${new Date().toLocaleDateString("en-US", { timeZone: "America/New_York", weekday: "long", month: "long", day: "numeric", year: "numeric" })}.
+- Warm but no fluff. No greetings, no "great question".
+- If the user sends container photos (a yard check): read every container number visible (4 letters + 6-7 digits, e.g. TRIU1234567). Be conservative — include ONLY numbers you can clearly read; never guess digits. Reply with one short line per photo batch (what you saw), then end the message with a fenced JSON block exactly like:
+\u0060\u0060\u0060json
+{"containers": ["ABCD1234567"]}
+\u0060\u0060\u0060
+- Empty reports: when asked for any report on yard empties (by owner, by age, weekly summary, email draft), build it from the LIVE DATA — plain text tables are fine.
+- Booking & changes: Glow can request NEW LOADS and RESCHEDULES right from this chat; you collect the details and the board emails BASE dispatch.
+  * New load: FIRST ask who should run it, ending that message with a fenced json block: \u0060\u0060\u0060json
+{"choices": ["BASE Carriers", "Our own fleet", "Another carrier"]}
+\u0060\u0060\u0060 (the board renders these as buttons; "Another carrier" -> ask for the carrier's name + contact). Then collect pickup location/date, delivery location/date + window, product + cases, any reference numbers — at most 2-3 short questions total, and assume Yell-O-Glow defaults (Everett, 00:00-05:00 window) when obvious.
+  * Reschedule ("move this pickup from Tuesday to Friday, deliver Monday"): identify the load (PO) from LIVE DATA when possible; confirm the new pickup and delivery dates.
+  * Once you have enough for either, summarize in one short paragraph, then end the message with a fenced json block: {"action": "email_dispatch", "kind": "new load request" or "reschedule request", "subject": "...", "lines": ["one detail per line"]}. The board shows the user a Send button — NEVER claim the email was already sent.
+- A fenced json block may appear ONLY at the very end of a message, never mid-message.
+
+LIVE DATA:
+${ctx}`;
+
+    const upstream = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "x-api-key": env.ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: MODEL,
+        max_tokens: 1400,
+        stream: true,
+        system,
+        messages: [
+          ...history,
+          {
+            role: "user",
+            content: images.length || docs.length
+              ? [
+                  ...images.map((d) => {
+                    const m = d.match(/^data:(image\/[a-z]+);base64,(.+)$/);
+                    return { type: "image", source: { type: "base64", media_type: m ? m[1] : "image/jpeg", data: m ? m[2] : "" } };
+                  }),
+                  ...docs.map((d) => {
+                    const m = d.match(/^data:application\/pdf;base64,(.+)$/);
+                    return { type: "document", source: { type: "base64", media_type: "application/pdf", data: m ? m[1] : "" } };
+                  }),
+                  { type: "text", text: question },
+                ]
+              : question,
+          },
+        ],
+      }),
+    });
+
+    if (!upstream.ok) {
+      const t = await upstream.text();
+      return new Response("upstream " + upstream.status + ": " + t.slice(0, 300), { status: 502, headers: CORS });
+    }
+
+    return new Response(upstream.body, {
+      headers: { ...CORS, "Content-Type": "text/event-stream", "Cache-Control": "no-store" },
+    });
+  },
+};
